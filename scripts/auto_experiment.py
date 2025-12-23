@@ -8,7 +8,7 @@ import time
 import re
 
 # [설정]
-NUM_ITERATIONS = 29
+NUM_ITERATIONS = 70
 MAX_WORKERS = 12
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "..", "data")
