@@ -210,7 +210,12 @@ __marimo__/
 
 data/
 data_previous/
+data_detection/
 scripts/logs/
+scripts/detection/
 src_previous/
+scripts/src_detection/
 
 archive/
+
+analysis_results_detection/

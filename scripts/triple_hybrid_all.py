@@ -11,40 +11,73 @@ from sklearn.linear_model import LogisticRegression
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+ANALYSIS_DIR = os.path.join(PROJECT_ROOT, "analysis_results")
+
+def get_latest_summary_report():
+    """3-클래스 형식의 최신 summary_report를 찾아 Neutral, Down, Up에 대한 QSVM 가중치 반환"""
+    if not os.path.exists(ANALYSIS_DIR):
+        print("⚠️ analysis_results 폴더가 없어 기본 가중치(0.5)를 사용합니다.")
+        return np.array([0.5, 0.5, 0.5])
+
+    # 3-클래스 리포트 파일 필터링
+    files = [f for f in os.listdir(ANALYSIS_DIR) if f.startswith("summary_report_3class_") and f.endswith(".csv")]
+    if not files:
+        print("⚠️ 3-클래스 요약 리포트가 없어 기본 가중치를 사용합니다.")
+        return np.array([0.5, 0.5, 0.5])
+
+    latest_file = sorted(files)[-1]
+    report_path = os.path.join(ANALYSIS_DIR, latest_file)
+    print(f"📊 최신 3-클래스 리포트 로드: {latest_file}")
+
+    try:
+        # MultiIndex(Class, Metric) 구조 로드
+        df = pd.read_csv(report_path, index_col=0, header=[0, 1])
+        target_classes = ['Neutral', 'Down', 'Up']
+        weights = []
+
+        for cls in target_classes:
+            if cls in df.index:
+                csvm_f1 = df.loc[cls, ('CSVM_F1', 'mean')]
+                qsvm_f1 = df.loc[cls, ('QSVM_F1', 'mean')]
+                # 상대적 성능 비중 계산
+                w_q = qsvm_f1 / (csvm_f1 + qsvm_f1 + 1e-9)
+                weights.append(w_q)
+            else:
+                weights.append(0.5)
+        
+        return np.array(weights)
+    except Exception as e:
+        print(f"❌ 가중치 계산 중 오류: {e}")
+        return np.array([0.5, 0.5, 0.5])
 
 def get_latest_folder(run_dir, prefix):
-    """특정 접두사로 시작하는 폴더 중 가장 최근 폴더 반환"""
+    """최신 예측 폴더(_prediction_) 반환"""
     folders = [f for f in os.listdir(run_dir) if f.startswith(prefix) and os.path.isdir(os.path.join(run_dir, f))]
     return os.path.join(run_dir, sorted(folders)[-1]) if folders else None
 
 def has_hybrid_folder(run_dir):
-    """이미 하이브리드 결과 폴더가 존재하는지 확인"""
     folders = [f for f in os.listdir(run_dir) if f.startswith("hybrid_comparison_")]
     return len(folders) > 0
 
-def run_hybrid_analysis(run_folder_name):
+def run_hybrid_analysis(run_folder_name, dynamic_weights):
     run_dir = os.path.join(DATA_DIR, run_folder_name)
     seed = int(run_folder_name.replace("run_", ""))
     
-    # 1. 중복 실행 방지 체크
     if has_hybrid_folder(run_dir):
         print(f"⏩ [Skip] {run_folder_name}: 하이브리드 결과가 이미 존재합니다.")
         return
 
-    print(f"🚀 [Process] {run_folder_name}: 하이브리드 분석을 시작합니다.")
-
-    # 2. 경로 설정 및 모델 로드
-    csvm_folder = get_latest_folder(run_dir, "classical_svm_")
-    qsvm_folder = get_latest_folder(run_dir, "quantum_kernel_")
+    # 2. 모델 로드 (최신 네이밍 규칙 적용)
+    csvm_folder = get_latest_folder(run_dir, "classical_svm_prediction_")
+    qsvm_folder = get_latest_folder(run_dir, "quantum_kernel_prediction_")
     
     if not csvm_folder or not qsvm_folder:
-        print(f"⚠️ [Error] {run_folder_name}: 모델 폴더를 찾을 수 없습니다. 건너뜁니다.")
         return
 
     save_dir = os.path.join(run_dir, f"hybrid_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(save_dir, exist_ok=True)
 
-    # 모델 및 데이터 로드
+    # 데이터 및 모델 로드
     csvm = joblib.load(os.path.join(csvm_folder, "classical_svm_model.pkl"))
     qsvm = joblib.load(os.path.join(qsvm_folder, "qsvm_model.pkl"))
     X = np.load(os.path.join(run_dir, "X_quantum.npy"))
@@ -52,26 +85,23 @@ def run_hybrid_analysis(run_folder_name):
     gram_train = np.load(os.path.join(qsvm_folder, "gram_train.npy"))
     gram_test = np.load(os.path.join(qsvm_folder, "gram_test.npy"))
     
-    # 데이터 분할 (기존 실험과 동일한 seed 사용)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
 
-    # 3. 확률값 추출
+    # 확률값 추출
     prob_c = csvm.predict_proba(X_test)
     prob_q = qsvm.predict_proba(gram_test)
     prob_c_train = csvm.predict_proba(X_train)
     prob_q_train = qsvm.predict_proba(gram_train)
 
     results = {}
-    target_names = ['Normal', 'Dip', 'Flash', 'Vol']
+    target_names = ['Neutral', 'Down', 'Up']
 
-    # --- [기법 1: 의사결정 융합 (Decision Fusion)] ---
-    # 각 모델의 예측 확률을 클래스별 가중치에 따라 합산
-    weights = np.array([0.6005, 0.6755, 0.2815, 0.4825]) # Dip(1)에 양자 가중치 집중
-    prob_fusion = (prob_q * weights) + (prob_c * (1 - weights))
+    # --- [기법 1: 동적 의사결정 융합 (Dynamic Decision Fusion)] ---
+    # 3-클래스별 동적 가중치 적용
+    prob_fusion = (prob_q * dynamic_weights) + (prob_c * (1 - dynamic_weights))
     results['Hybrid_Fusion'] = np.argmax(prob_fusion, axis=1)
 
     # --- [기법 2: 계층적 분류 (Cascading)] ---
-    # CSVM 결과가 모호할 때만 QSVM에게 최종 판단을 맡김
     threshold = 0.6
     y_cascading = []
     for i in range(len(prob_c)):
@@ -82,17 +112,15 @@ def run_hybrid_analysis(run_folder_name):
     results['Hybrid_Cascading'] = np.array(y_cascading)
 
     # --- [기법 3: 메타 학습 (Stacked Generalization)] ---
-    # CSVM과 QSVM의 예측값을 새로운 특징으로 삼아 최종 결정
     X_meta_train = np.hstack([prob_c_train, prob_q_train])
     X_meta_test = np.hstack([prob_c, prob_q])
-    meta_model = LogisticRegression().fit(X_meta_train, y_train) # 인덱스 오류 수정 완료
+    meta_model = LogisticRegression(max_iter=1000).fit(X_meta_train, y_train)
     results['Hybrid_Stacking'] = meta_model.predict(X_meta_test)
 
-    # 베이스라인 기록
     results['Baseline_CSVM'] = np.argmax(prob_c, axis=1)
     results['Baseline_QSVM'] = np.argmax(prob_q, axis=1)
 
-    # 4. 결과 저장
+    # 4. 결과 저장 (3-클래스 지표 반영)
     comparison_data = []
     for name, y_pred in results.items():
         report = classification_report(y_test, y_pred, target_names=target_names, output_dict=True, zero_division=0)
@@ -102,26 +130,29 @@ def run_hybrid_analysis(run_folder_name):
             "Method": name,
             "Accuracy": report['accuracy'],
             "Macro_F1": report['macro avg']['f1-score'],
-            "Dip_F1": report['Dip']['f1-score'],
-            "Vol_F1": report['Vol']['f1-score']
+            "Down_F1": report['Down']['f1-score'],
+            "Up_F1": report['Up']['f1-score'],
+            "Neutral_F1": report['Neutral']['f1-score']
         })
 
     pd.DataFrame(comparison_data).to_csv(os.path.join(save_dir, "hybrid_total_comparison.csv"), index=False)
-    print(f"✅ [Done] {run_folder_name}: 분석 완료 및 저장 ({save_dir})")
+    print(f"✅ [Done] {run_folder_name}: 가중치 {dynamic_weights} 적용 분석 완료")
 
 def main():
-    if not os.path.exists(DATA_DIR):
-        print(f"❌ 데이터 폴더가 없습니다: {DATA_DIR}")
-        return
+    if not os.path.exists(DATA_DIR): return
+
+    # 동적 가중치 로드 (Neutral, Down, Up 순서)
+    dynamic_weights = get_latest_summary_report()
+    print(f"🚀 결정된 융합 가중치 (QSVM 비중):")
+    for i, name in enumerate(['Neutral', 'Down', 'Up']):
+        print(f"   - {name:8}: {dynamic_weights[i]:.4f}")
 
     run_folders = [f for f in os.listdir(DATA_DIR) if f.startswith("run_") and os.path.isdir(os.path.join(DATA_DIR, f))]
-    print(f"🔍 총 {len(run_folders)}개의 실험 폴더를 검사합니다.")
-
     for run_folder in sorted(run_folders):
         try:
-            run_hybrid_analysis(run_folder)
+            run_hybrid_analysis(run_folder, dynamic_weights)
         except Exception as e:
-            print(f"❌ {run_folder} 처리 중 예외 발생: {e}")
+            print(f"❌ {run_folder} 예외: {e}")
 
 if __name__ == "__main__":
     main()

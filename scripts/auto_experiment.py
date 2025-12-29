@@ -8,14 +8,14 @@ import time
 import re
 
 # [설정]
-NUM_ITERATIONS = 70
-MAX_WORKERS = 12
+NUM_ITERATIONS = 1
+MAX_WORKERS = 4
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "..", "data")
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 
 def run_pipeline(seed, status_dict):
-    status_dict[seed] = {"Cleaning": "대기", "Prep": "대기", "CSVM": "대기", "QSVM": "대기"}
+    status_dict[seed] = {"Cleaning": "대기", "Prep": "대기", "CSVM": "대기", "QSVM": "대기", "ErrorLog": ""}
     steps = [
         ("Cleaning", "auto_cleaning_btc_data.py"),
         ("Prep", "auto_prepare_quantum_data.py"),
@@ -25,27 +25,35 @@ def run_pipeline(seed, status_dict):
     
     try:
         for step_name, script_name in steps:
-            # 상태 업데이트
             temp_status = status_dict[seed]
-            temp_status[step_name] = "🔄 실행 중..."
+            temp_status[step_name] = "🔄 실행 중"
             status_dict[seed] = temp_status
             
             script_path = os.path.join(SRC_DIR, script_name)
+            
+            # stderr를 stdout으로 통합하여 모든 에러 메시지를 캡처
             process = subprocess.Popen(
                 ["python", "-u", script_path, "--seed", str(seed)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                bufsize=1,
+                errors='ignore'
             )
 
+            last_output = []
             while True:
                 line = process.stdout.readline()
                 if not line and process.poll() is not None: break
-                
                 if line:
-                    # [패치] 하위 스크립트의 "Seed #### Train: 500/25600 (2.0%)" 형식을 낚아챔
-                    match = re.search(r"Seed \d+ .*: (\d+/\d+) \((\d+\.\d+)%\)", line)
+                    line_strip = line.strip()
+                    last_output.append(line_strip)
+                    if len(last_output) > 10: last_output.pop(0) # 마지막 10줄만 유지
+
+                    match = re.search(r".*: (\d+/\d+) \((\d+\.\d+)%\)", line)
                     if match:
                         temp_status = status_dict[seed]
-                        temp_status[step_name] = f"[{match.group(1)}] ({match.group(2)}%)"
+                        temp_status[step_name] = f"⏳ {match.group(2)}%"
                         status_dict[seed] = temp_status
 
             if process.returncode == 0:
@@ -53,13 +61,15 @@ def run_pipeline(seed, status_dict):
                 temp_status[step_name] = "✅ 완료"
                 status_dict[seed] = temp_status
             else:
+                # 에러 발생 시 해당 단계와 마지막 출력을 저장
                 temp_status = status_dict[seed]
                 temp_status[step_name] = "❌ 에러"
+                temp_status["ErrorLog"] = f"[{step_name} 실패] " + " | ".join(last_output[-3:])
                 status_dict[seed] = temp_status
                 return
     except Exception as e:
         temp_status = status_dict[seed]
-        temp_status["Error"] = str(e)
+        temp_status["ErrorLog"] = f"[예외 발생] {str(e)}"
         status_dict[seed] = temp_status
 
 def monitor_display(status_dict, target_seeds, log_path, stop_event):
@@ -69,7 +79,6 @@ def monitor_display(status_dict, target_seeds, log_path, stop_event):
             os.system('cls' if os.name == 'nt' else 'clear')
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
             
-            # --- 대시보드 구성 ---
             dashboard = "="*70 + "\n"
             dashboard += f" 🚀 양자 머신러닝 실험 실시간 대시보드 (경과 시간: {elapsed})\n"
             dashboard += "="*70 + "\n"
@@ -83,13 +92,12 @@ def monitor_display(status_dict, target_seeds, log_path, stop_event):
                 dashboard += f"  - Quantum SVM   : {info.get('QSVM', '대기')}\n"
                 dashboard += "-" * 35 + "\n"
                 
-                # 종료 판정
-                if not all(info.get(s) == "✅ 완료" or "❌" in str(info.get(s)) for s in ["Cleaning", "Prep", "CSVM", "QSVM"]):
+                # 하나라도 진행 중이면 완료 아님
+                steps_status = [info.get(s) for s in ["Cleaning", "Prep", "CSVM", "QSVM"]]
+                if not all(s == "✅ 완료" or s == "❌ 에러" for s in steps_status):
                     all_done = False
 
             print(dashboard)
-            
-            # [패치] 로그 파일에 줄바꿈이 포함된 대시보드 내용을 실시간 저장
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write(dashboard)
             
@@ -106,14 +114,11 @@ def main():
         if f"run_{seed}" not in existing_folders and seed not in target_seeds:
             target_seeds.append(seed)
 
-    log_dir = os.path.join(PROJECT_ROOT, "logs") # scripts/logs 폴더
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-        print(f"로그 폴더를 생성했습니다: {log_dir}")
+    log_dir = os.path.join(PROJECT_ROOT, "logs")
+    if not os.path.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
 
     log_filename = f"experiment_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    log_filedir = os.path.join(log_dir, log_filename)
-    log_path = os.path.join(PROJECT_ROOT, log_filedir)
+    log_path = os.path.join(log_dir, log_filename)
 
     with Manager() as manager:
         status_dict = manager.dict()
@@ -134,6 +139,21 @@ def main():
         
         stop_event.set()
         monitor_p.join(timeout=2)
+
+        # --- [추가] 에러 구체적 리포트 ---
+        print("\n" + "!"*70)
+        print(" 🔍 에러 발생 시드 리포트")
+        print("!"*70)
+        error_found = False
+        for seed in target_seeds:
+            info = status_dict.get(seed, {})
+            if info.get("ErrorLog"):
+                error_found = True
+                print(f"❌ Seed {seed:5} 실패 사유: {info['ErrorLog']}")
+        
+        if not error_found:
+            print("✅ 모든 시드가 성공적으로 완료되었습니다.")
+        print("!"*70)
 
     print(f"\n최종 리포트가 {log_filename}에 저장되었습니다.")
 

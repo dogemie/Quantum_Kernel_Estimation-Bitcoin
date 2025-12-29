@@ -2,21 +2,21 @@ import pandas as pd
 import numpy as np
 import os
 import argparse
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.decomposition import KernelPCA
+from sklearn.preprocessing import RobustScaler, MinMaxScaler
+import matplotlib
+matplotlib.use('Agg')
 
 def main():
-    # 1. 인자 처리 (자동화 스크립트로부터 seed를 받음)
+    # 1. 인자 처리
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, required=True, help='Random seed to locate the run directory')
     args = parser.parse_args()
 
     # 2. 경로 설정
-    # 현재 파일 위치: (Project)/scripts/src/auto_prepare_quantum_data.py
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.join(current_dir, "..", "..")
+    project_root = os.path.normpath(os.path.join(current_dir, "..", ".."))
     
-    # 해당 시드의 작업 폴더 지정
     run_dir = os.path.join(project_root, "data", f"run_{args.seed}")
     input_file = os.path.join(run_dir, f"cleaned_btc_data_{args.seed}.csv")
     
@@ -24,35 +24,48 @@ def main():
     output_y = os.path.join(run_dir, "y_label.npy")
 
     if not os.path.exists(input_file):
-        return # 파일이 없으면 조용히 종료
+        print(f"Error: {input_file} not found.")
+        return
 
     # 3. 데이터 로드
     df = pd.read_csv(input_file)
-    features = ['Return', 'Range', 'RSI', 'Vol_Ratio']
-    X = df[features]
-    y = df['Label'].values
+    
+    # [수정] 분수 차분 특징을 포함한 16차원 벡터 구성
+    base_features = ['FracDiff_Close', 'Range', 'RSI', 'Vol_Ratio']
+    lagged_features = []
+    
+    # t 시점부터 t-3 시점(총 4개 캔들) 정보 수집
+    for f in base_features:
+        lagged_features.append(f)
+        for i in range(1, 4):
+            lagged_features.append(f + f'_lag{i}')
+    
+    X = df[lagged_features]
+    y = df['Target_Label'].values
 
-    # 4. 데이터 표준화 (Standardization)
-    # PCA 전 필수: 각 지표의 단위를 평균 0, 표준편차 1로 정규화
-    scaler_std = StandardScaler()
-    X_std = scaler_std.fit_transform(X)
+    # 4. [혁신] Robust Scaling 도입
+    # 비트코인 특유의 꼬리가 두꺼운(Fat-tail) 분포와 이상치를 보존하기 위해 
+    # StandardScaler 대신 중앙값과 사분위수를 사용하는 RobustScaler 적용
+    scaler_robust = RobustScaler()
+    X_robust = scaler_robust.fit_transform(X)
 
-    # 5. PCA를 이용한 특징 재배열
-    # 4개의 지표를 유지하되, 정보 밀도가 높은 축(주성분)으로 투영
-    pca = PCA(n_components=4)
-    X_pca = pca.fit_transform(X_std)
+    # 5. [핵심] Kernel PCA를 통한 비선형 특징 추출
+    # 단순 선형 PCA는 금융 데이터의 복잡한 상관관계를 뭉개버릴 수 있음
+    # 'rbf' 커널을 사용한 KPCA를 통해 양자 힐베르트 공간에 적합한 비선형 특징을 먼저 추출
+    kpca = KernelPCA(n_components=4, kernel='rbf', gamma=None, fit_inverse_transform=True, random_state=args.seed)
+    X_kpca = kpca.fit_transform(X_robust)
 
-    # 6. 양자 회로용 스케일링 (0 ~ pi)
-    # 데이터를 양자 게이트의 회전 각도로 사용하기 위해 변환
+    # 6. 양자 회로용 최적화 스케일링 (0 ~ pi)
+    # ZZ Feature Map의 위상 변이(Phase Shift) 범위에 맞게 정렬
     scaler_minmax = MinMaxScaler(feature_range=(0, np.pi))
-    X_qs = scaler_minmax.fit_transform(X_pca)
+    X_qs = scaler_minmax.fit_transform(X_kpca)
 
-    # 7. 최종 데이터 저장 (해당 시드 폴더 내)
+    # 7. 최종 데이터 저장
     np.save(output_x, X_qs)
     np.save(output_y, y)
 
-    # 자동화 파이프라인을 위해 요약 정보만 한 줄 출력 (선택 사항)
-    # print(f"[PCA 완료] Seed {args.seed}: Explained Variance {np.sum(pca.explained_variance_ratio_)*100:.2f}%")
+    # 정보 보존율 근사 보고 (Kernel PCA는 직접적인 분산 비율 제공이 어려워 변동성 보존으로 대체)
+    print(f"[Prep 완료] Seed {args.seed}: 16D -> 4D (Non-linear Geometric Alignment applied)")
 
 if __name__ == "__main__":
     main()
